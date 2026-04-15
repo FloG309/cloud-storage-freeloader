@@ -1130,4 +1130,327 @@ github.com/google/uuid              # operation IDs
 golang.org/x/oauth2                 # OAuth2 flows
 github.com/sergi/go-diff            # Myers diff algorithm (live sync patches)
 github.com/fsnotify/fsnotify        # cross-platform filesystem watcher
+gopkg.in/yaml.v3                    # YAML config parsing
 ```
+
+---
+
+## Phase 12: Config Loading from YAML
+
+Wire `config.local.yaml` into typed, testable Go structs so the CLI and
+provider factory can consume provider credentials.
+
+### 12.1 — Config types and YAML parsing
+
+```
+RED   → internal/config/config_test.go
+        - TestConfig_LoadFromBytes: parse YAML with all 3 providers, assert
+          Providers slice length 3, each with correct Name/Type
+        - TestConfig_LoadFromFile: write temp YAML file, LoadFile(), assert parsed
+        - TestConfig_BackblazeFields: assert Endpoint, Region, Bucket, KeyID,
+          ApplicationKey populated
+        - TestConfig_GDriveFields: assert ClientID, ClientSecret, TokensFile,
+          BaseFolder populated
+        - TestConfig_OneDriveFields: assert ClientID, AuthEndpoint, PublicClient=true,
+          TokensFile, BaseFolder populated
+        - TestConfig_MissingFile: LoadFile("nonexistent") returns error
+        - TestConfig_ProviderByName: cfg.Provider("backblaze") returns entry,
+          cfg.Provider("unknown") returns nil
+        - TestConfig_BaseFolder: assert top-level base_folder parsed
+        - TestConfig_TierField: assert tier parsed as "hot"/"warm"/"cold"
+
+GREEN → internal/config/config.go
+        - Config struct, ProviderConfig struct with yaml tags
+        - LoadFile(path) / LoadBytes(data) → (*Config, error)
+        - Provider(name) → *ProviderConfig helper
+```
+
+### 12.2 — OAuth2 token persistence
+
+```
+RED   → internal/config/token_store_test.go
+        - TestTokenStore_LoadTokens: load gdrive_tokens.json format, assert
+          AccessToken, RefreshToken, ExpiresIn parsed
+        - TestTokenStore_SaveTokens: save to temp file, re-load, assert roundtrip
+        - TestTokenStore_MissingFile: assert descriptive error
+
+GREEN → internal/config/token_store.go
+        - TokenData struct, LoadTokens(), SaveTokens() (atomic write via
+          temp file + rename)
+```
+
+---
+
+## Phase 13: Real S3 Backend (aws-sdk-go-v2)
+
+The existing `s3.Backend` delegates to an injected store via `NewWithStore()`.
+This phase adds `NewFromConfig()` that creates a real AWS SDK client targeting
+Backblaze B2.
+
+### 13.1 — S3 real operations via httptest mock
+
+```
+RED   → internal/provider/s3/s3_real_test.go
+        - TestS3Real_PutAndGet: httptest server mimicking S3 PutObject/GetObject,
+          assert correct bucket/key in URL, body matches
+        - TestS3Real_Delete: httptest returns 204 on DeleteObject
+        - TestS3Real_Exists_True: httptest returns 200 on HeadObject
+        - TestS3Real_Exists_False: httptest returns 404
+        - TestS3Real_List: httptest returns ListObjectsV2 XML with 3 keys,
+          assert parsed correctly
+        - TestS3Real_GetNotFound: httptest returns 404/NoSuchKey, assert error
+
+GREEN → internal/provider/s3/s3.go
+        - NewFromConfig(cfg map[string]string) (*Backend, error)
+        - Real Put/Get/Delete/Exists/List using aws-sdk-go-v2
+        - Dispatches via store (test) or client (real) based on which is set
+```
+
+### 13.2 — S3 integration tests (real Backblaze B2)
+
+```
+RED   → internal/provider/s3/s3_integration_test.go
+        //go:build integration
+
+        - TestS3Integration_PutGetDelete: roundtrip to freeloader-test-bucket
+        - TestS3Integration_ListWithPrefix: put 3, list by prefix, assert 3
+        - TestS3Integration_LargeObject: 10MB roundtrip
+
+        Config loaded from config.local.yaml. t.Cleanup() deletes test objects.
+
+GREEN → Already implemented in 13.1.
+```
+
+---
+
+## Phase 14: Real Google Drive Backend (Drive API v3)
+
+### 14.1 — OAuth2 token source with auto-refresh
+
+```
+RED   → internal/provider/gdrive/oauth_test.go
+        - TestGDriveOAuth_TokenSource: create from test tokens, assert valid
+        - TestGDriveOAuth_RefreshOnExpiry: httptest OAuth server, expired token,
+          assert refresh request sent with correct refresh_token
+        - TestGDriveOAuth_RefreshPersists: after refresh, tokens file updated
+
+GREEN → internal/provider/gdrive/oauth.go
+        - NewTokenSource(clientID, clientSecret, tokensFile) → PersistentTokenSource
+        - Wraps oauth2.TokenSource, saves refreshed tokens to disk
+```
+
+### 14.2 — Google Drive API operations (httptest mock)
+
+```
+RED   → internal/provider/gdrive/gdrive_real_test.go
+        - TestGDriveReal_EnsureBaseFolder: folder doesn't exist → created
+        - TestGDriveReal_EnsureBaseFolderExists: folder exists → no create
+        - TestGDriveReal_PutAndGet: multipart upload, download via alt=media
+        - TestGDriveReal_Delete: delete file by ID
+        - TestGDriveReal_List: list files in folder with prefix filter
+        - TestGDriveReal_Available: parse storageQuota from /about
+        - TestGDriveReal_ScopedToFolder: ALL queries include base folder filter
+
+GREEN → internal/provider/gdrive/gdrive.go
+        - NewFromConfig(cfg) → Backend with real HTTP client
+        - Key mapping: "/" → "__" for flat file names in base folder
+        - ensureBaseFolder(): find or create "cloud-storage-freeloader/"
+        - Put/Get/Delete/Exists/List/Available via Drive API v3
+```
+
+### 14.3 — Google Drive integration tests
+
+```
+RED   → internal/provider/gdrive/gdrive_integration_test.go
+        //go:build integration
+
+        - TestGDriveIntegration_PutGetDelete: real roundtrip
+        - TestGDriveIntegration_ListWithPrefix
+        - TestGDriveIntegration_Available: positive space
+        - TestGDriveIntegration_ScopeVerification: nothing outside base folder
+
+GREEN → Already implemented in 14.2.
+```
+
+---
+
+## Phase 15: Real OneDrive Backend (Microsoft Graph API)
+
+### 15.1 — OneDrive OAuth2 (public client, no secret)
+
+```
+RED   → internal/provider/onedrive/oauth_test.go
+        - TestOneDriveOAuth_TokenSource: valid token source
+        - TestOneDriveOAuth_RefreshPublicClient: no client_secret in refresh
+        - TestOneDriveOAuth_RefreshPersists: tokens file updated
+
+GREEN → internal/provider/onedrive/oauth.go
+        - Public client refresh: grant_type=refresh_token, client_id only
+```
+
+### 15.2 — OneDrive Graph API operations (httptest mock)
+
+```
+RED   → internal/provider/onedrive/onedrive_real_test.go
+        - TestOneDriveReal_EnsureBaseFolder: create if missing
+        - TestOneDriveReal_Put: small file (<4MB) direct PUT
+        - TestOneDriveReal_PutLargeFile: >4MB triggers upload session
+        - TestOneDriveReal_Get: download via /content
+        - TestOneDriveReal_Delete: DELETE by item ID
+        - TestOneDriveReal_List: list children with prefix
+        - TestOneDriveReal_Available: parse quota.remaining
+        - TestOneDriveReal_ScopedToFolder: all paths under base folder
+
+GREEN → internal/provider/onedrive/onedrive.go
+        - NewFromConfig(cfg) → Backend with real HTTP client
+        - Key mapping: "/" → "__" for flat names
+        - Put: small=direct PUT, large=upload session
+        - All ops via Graph API /me/drive/root:/cloud-storage-freeloader/...
+```
+
+### 15.3 — OneDrive integration tests
+
+```
+RED   → internal/provider/onedrive/onedrive_integration_test.go
+        //go:build integration
+
+        - TestOneDriveIntegration_PutGetDelete
+        - TestOneDriveIntegration_LargeFile: 5MB upload session
+        - TestOneDriveIntegration_Available
+
+GREEN → Already implemented in 15.2.
+```
+
+---
+
+## Phase 16: Provider Factory (Config → Real Backends)
+
+### 16.1 — Factory wiring
+
+```
+RED   → internal/provider/factory_test.go
+        - TestFactory_CreateAll: load Config with 3 providers, create all,
+          assert 3 backends in map[string]StorageBackend
+        - TestFactory_NamesMatchConfig: map keys = provider names
+        - TestFactory_UnknownType: type="ftp" → error
+
+GREEN → internal/provider/factory.go
+        - CreateBackends(cfg) → (map[string]StorageBackend, []ProviderInfo, error)
+        - Switch on Type: "s3"→s3.NewFromConfig, "gdrive"→gdrive.NewFromConfig,
+          "onedrive"→onedrive.NewFromConfig
+```
+
+### 16.2 — CLI mount command wiring
+
+```
+GREEN → cmd/freeloader/main.go
+        - Update mount command: load config → create backends → create VFS →
+          mount via FUSE
+        - Add --config flag (default "config.local.yaml")
+        - Add --mount-point flag (default "X:")
+```
+
+---
+
+## Phase 17: WinFsp Bridge (cgofuse)
+
+Requires: WinFsp installed (https://winfsp.dev), MinGW gcc for CGO.
+
+### 17.1 — cgofuse FileSystemInterface
+
+```
+RED   → internal/fuse/bridge_test.go
+        //go:build cgo && windows
+
+        - TestBridge_Getattr_Root: returns directory attributes
+        - TestBridge_Getattr_File: correct size after VFS write
+        - TestBridge_Readdir: correct entries from VFS
+        - TestBridge_CreateWriteRead: Create → Write → Read roundtrip
+        - TestBridge_Unlink: file gone after delete
+        - TestBridge_Rename: old gone, new exists
+        - TestBridge_Statfs: reasonable fs stats
+
+GREEN → internal/fuse/bridge.go
+        //go:build cgo && windows
+
+        - Bridge struct implementing cgofuse.FileSystemInterface
+        - Write buffering per file handle (flush on Release)
+        - Translate FUSE calls → VFS calls
+```
+
+### 17.2 — Mount/Unmount with drive letter
+
+```
+RED   → internal/fuse/mount_cgo_test.go
+        //go:build cgo && windows && integration
+
+        - TestMount_WriteReadViaOS: mount X:, os.WriteFile, os.ReadFile
+        - TestMount_ListDirViaOS: create files, os.ReadDir
+        - TestMount_DeleteViaOS: os.Remove, assert gone
+
+GREEN → internal/fuse/mount.go
+        - Mount(): create Bridge → cgofuse.FileSystemHost → host.Mount()
+        - Unmount(): host.Unmount()
+```
+
+---
+
+## Phase 18: End-to-End Verification
+
+### 18.1 — Full pipeline integration test
+
+```
+RED   → internal/e2e/e2e_test.go
+        //go:build integration && cgo && windows
+
+        - TestE2E_WriteFileAndVerifyShards:
+          1. Load config, create real backends (Backblaze, GDrive, OneDrive)
+          2. RS(2,1) — 2 data + 1 parity for 3 providers
+          3. Mount at X:
+          4. os.WriteFile("X:\\test-e2e.txt", "Hello from E2E!")
+          5. Query each provider: assert shards exist
+          6. Unmount, remount, os.ReadFile → assert same content
+          7. Clean up all shards
+
+        - TestE2E_ProviderDistribution:
+          1. Write file, inspect shard map
+          2. Assert data shards on hot providers (Backblaze, GDrive)
+          3. Assert parity shard on warm provider (OneDrive)
+          4. Assert no provider holds duplicate shards
+
+GREEN → No new production code. Validates full pipeline. Fix wiring if tests fail.
+```
+
+---
+
+## Extended Implementation Order
+
+```
+Phases 1-11 (done) ──→ Phase 12 (config) ──→ Phase 13 (S3) ─────┐
+                                         ├──→ Phase 14 (GDrive) ──┼──→ Phase 16 (factory) ──→ Phase 18 (E2E)
+                                         └──→ Phase 15 (OneDrive)─┘          ↑
+                                                                   Phase 17 (WinFsp) ──┘
+```
+
+## Design Decisions
+
+1. **Key mapping**: GDrive/OneDrive use flat file names with "/" replaced by "__"
+   (e.g. `shards__myfile__seg0__shard1`). Avoids deep folder nesting overhead.
+
+2. **Write buffering in FUSE**: VFS.Write() needs full file data for erasure coding,
+   so the FUSE bridge buffers all Write() calls per file handle and flushes on Release().
+
+3. **RS(2,1) for 3 providers**: 2 data shards on hot (Backblaze, GDrive), 1 parity
+   on warm (OneDrive). Survives any single provider failure.
+
+4. **Build tags**: `integration` for real cloud tests, `cgo && windows` for WinFsp.
+   `go test ./...` stays fast and offline by default.
+
+5. **Token persistence**: OAuth2 tokens saved after every refresh (atomic write).
+   App survives restarts without re-authorization.
+
+## Prerequisites for Phase 17-18
+
+- Install WinFsp: https://winfsp.dev/rel/ (download .msi installer)
+- Install MinGW gcc: `choco install mingw` or https://www.mingw-w64.org/
+- Set `CGO_ENABLED=1` in environment

@@ -24,17 +24,22 @@ func newRootCmd() *cobra.Command {
 
 func newMountCmd() *cobra.Command {
 	var mountPath string
+	var configPath string
 
 	cmd := &cobra.Command{
 		Use:   "mount",
 		Short: "Mount the virtual drive",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if configPath != "" {
+				cmd.Printf("Using config: %s\n", configPath)
+			}
 			cmd.Printf("Mounting at %s\n", mountPath)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&mountPath, "path", "", "Mount point path")
+	cmd.Flags().StringVar(&configPath, "config", "config.local.yaml", "Config file path")
 	return cmd
 }
 
